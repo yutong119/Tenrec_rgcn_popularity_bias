@@ -1,0 +1,21 @@
+@"
+.venv/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+
+outputs/
+*.pt
+*.pth
+*.ckpt
+
+tenrec_rgcn_prepared/
+tenrec_shared_subset_output/
+
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
+legacy/
+
+legacy/
