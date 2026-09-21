@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from tenrec_rgcn_dataset import TenRecFullGraphDataset
 from tenrec_rgcn_fullmap import TenRecFullGraphRGCN
 
+from torch import nn
 SOURCE_DOMAIN = "QK-video"
 TARGET_DOMAIN = "QK-article"
 
@@ -93,9 +94,31 @@ def load_frozen_source_user_repr(
         return None
 
     checkpoint = torch.load(
-        args.source_checkpoint,
+        checkpoint_path,
         map_location=device,
     )
+
+    model.load_state_dict(
+        checkpoint[
+            "target_model_state_dict"
+        ]
+    )
+
+    if projector is not None:
+
+        projector_state = checkpoint[
+            "projector_state_dict"
+        ]
+
+        if projector_state is None:
+            raise RuntimeError(
+                "Current run requires a projector, "
+                "but checkpoint has no projector state."
+            )
+
+        projector.load_state_dict(
+            projector_state
+        )
 
     source_args = checkpoint["args"]
 
@@ -194,52 +217,173 @@ def evaluate(
     edge_type: torch.Tensor,
     device: torch.device,
     split: Literal["val", "test"],
+    projector: nn.Module | None = None,
+    source_user_repr_aligned: torch.Tensor | None = None,
+    transfer_scale: float = 1.0,
     k: int = 10,
     user_batch_size: int = 128,
 ) -> Dict[str, float]:
     """
-    Performance + POST-HOC popularity diagnosis.
+    Evaluate target-domain recommendation performance and
+    post-hoc popularity bias.
 
-    Popularity is used only as a measuring ruler here. It never changes
-    model parameters, raw recommendation scores, or ranking.
+    If source_user_repr_aligned is provided, the frozen source-domain
+    user representation is projected into the target embedding space
+    and injected into the target RGCN input.
+
+    Popularity is diagnosis-only and never affects training or ranking.
     """
+
     model.eval()
 
-    user_repr, item_repr = model.encode(edge_index, edge_type)
+    if projector is not None:
+        projector.eval()
+
+    # ------------------------------------------------------------
+    # Build external source-domain user context.
+    #
+    # target_only:
+    #     source_user_repr_aligned = None
+    #     external_user_context = None
+    #
+    # correct / shuffled:
+    #     source_user_repr_aligned exists
+    #     projector maps Source embedding -> Target embedding space
+    # ------------------------------------------------------------
+
+    external_user_context = None
+
+    if source_user_repr_aligned is not None:
+        if projector is None:
+            raise RuntimeError(
+                "source_user_repr_aligned is provided, "
+                "but projector is None."
+            )
+
+        external_user_context = projector(
+            source_user_repr_aligned
+        )
+
+    # ------------------------------------------------------------
+    # Target RGCN encoding.
+    #
+    # target_only:
+    #     equivalent to the original RGCN baseline.
+    #
+    # cross-domain:
+    #     target initial user embedding
+    #          +
+    #     projected source user context
+    #          ↓
+    #     Target RGCN
+    # ------------------------------------------------------------
+
+    # ------------------------------------------------------------
+    # Build transferred Source context.
+    #
+    # target_only:
+    #     external_user_context = None
+    #
+    # correct / shuffled:
+    #     frozen Source repr
+    #          ↓
+    #     trainable projector
+    #          ↓
+    #     Target embedding space
+    # ------------------------------------------------------------
+
+    external_user_context = None
+
+    if source_user_repr_aligned is not None:
+
+        if projector is None:
+            raise RuntimeError(
+                "Source user representations exist "
+                "but projector is None."
+            )
+
+        external_user_context = projector(
+            source_user_repr_aligned
+        )
+
+    # ------------------------------------------------------------
+    # One full Target-domain RGCN convolution per optimizer update.
+    #
+    # Source information enters BEFORE Target RGCN propagation.
+    # ------------------------------------------------------------
+
+    user_repr, item_repr = model.encode(
+        edge_index,
+        edge_type,
+        external_user_context=external_user_context,
+        transfer_scale=args.alpha,
+    )
 
     if split == "val":
         target_by_user = dataset.val_item_by_user
         other_holdout_by_user = dataset.test_item_by_user
+
     elif split == "test":
         target_by_user = dataset.test_item_by_user
         other_holdout_by_user = dataset.val_item_by_user
-    else:
-        raise ValueError("split must be 'val' or 'test'.")
 
-    # Diagnosis-only popularity statistics.
+    else:
+        raise ValueError(
+            "split must be 'val' or 'test'."
+        )
+
+    # ------------------------------------------------------------
+    # Popularity diagnosis only.
+    # ------------------------------------------------------------
+
     pop_raw = dataset.item_popularity_raw.to(device)
     pop_norm = dataset.item_popularity_norm.to(device)
-    profile_pop_raw = dataset.user_profile_popularity(False).to(device)
-    profile_pop_norm = dataset.user_profile_popularity(True).to(device)
+
+    profile_pop_raw = (
+        dataset.user_profile_popularity(False).to(device)
+    )
+
+    profile_pop_norm = (
+        dataset.user_profile_popularity(True).to(device)
+    )
+
     tail_mask = dataset.tail_item_mask.to(device)
     head_mask = ~tail_mask
 
     recall_sum = 0.0
     ndcg_sum = 0.0
+
     rec_pop_raw_sum = 0.0
     rec_pop_norm_sum = 0.0
+
     profile_pop_raw_sum = 0.0
     profile_pop_norm_sum = 0.0
+
     head_slots = 0
     tail_slots = 0
     total_slots = 0
+
     all_recommended_items: List[torch.Tensor] = []
 
-    user_indices = np.arange(dataset.num_users, dtype=np.int64)
+    user_indices = np.arange(
+        dataset.num_users,
+        dtype=np.int64,
+    )
 
-    for start in range(0, dataset.num_users, user_batch_size):
-        batch_np = user_indices[start:start + user_batch_size]
-        batch_users = torch.from_numpy(batch_np).long().to(device)
+    for start in range(
+        0,
+        dataset.num_users,
+        user_batch_size,
+    ):
+        batch_np = user_indices[
+            start:start + user_batch_size
+        ]
+
+        batch_users = (
+            torch.from_numpy(batch_np)
+            .long()
+            .to(device)
+        )
 
         scores = model.score_user_batch_against_all_items(
             batch_users,
@@ -247,20 +391,41 @@ def evaluate(
             item_repr,
         )
 
-        # Remove training positive-relation items from candidates.
-        # Also hide the other held-out positive so val/test do not compete.
+        # --------------------------------------------------------
+        # Remove training-positive items.
+        #
+        # Also remove the OTHER held-out item so validation and
+        # test positives do not compete against each other.
+        # --------------------------------------------------------
+
         for local_row, user_idx in enumerate(batch_np):
-            seen = dataset.train_seen_items_by_user[int(user_idx)]
+
+            seen = dataset.train_seen_items_by_user[
+                int(user_idx)
+            ]
+
             if seen:
                 seen_idx = torch.tensor(
                     list(seen),
                     dtype=torch.long,
                     device=device,
                 )
-                scores[local_row, seen_idx] = -torch.inf
 
-            other_item = int(other_holdout_by_user[int(user_idx)])
-            scores[local_row, other_item] = -torch.inf
+                scores[
+                    local_row,
+                    seen_idx,
+                ] = -torch.inf
+
+            other_item = int(
+                other_holdout_by_user[
+                    int(user_idx)
+                ]
+            )
+
+            scores[
+                local_row,
+                other_item,
+            ] = -torch.inf
 
         topk = torch.topk(
             scores,
@@ -268,63 +433,187 @@ def evaluate(
             dim=1,
         ).indices
 
-        all_recommended_items.append(topk.detach().cpu())
+        all_recommended_items.append(
+            topk.detach().cpu()
+        )
+
+        # --------------------------------------------------------
+        # Recall + NDCG
+        # --------------------------------------------------------
 
         for local_row, user_idx in enumerate(batch_np):
-            target = int(target_by_user[int(user_idx)])
-            matches = (topk[local_row] == target).nonzero(as_tuple=False)
+
+            target = int(
+                target_by_user[
+                    int(user_idx)
+                ]
+            )
+
+            matches = (
+                topk[local_row] == target
+            ).nonzero(
+                as_tuple=False
+            )
+
             if matches.numel() > 0:
-                rank_zero_based = int(matches[0].item())
+
+                rank_zero_based = int(
+                    matches[0].item()
+                )
+
                 recall_sum += 1.0
-                ndcg_sum += 1.0 / math.log2(rank_zero_based + 2)
 
-        batch_rec_pop_raw = pop_raw[topk].mean(dim=1)
-        batch_rec_pop_norm = pop_norm[topk].mean(dim=1)
-        rec_pop_raw_sum += float(batch_rec_pop_raw.sum().item())
-        rec_pop_norm_sum += float(batch_rec_pop_norm.sum().item())
+                ndcg_sum += (
+                    1.0
+                    / math.log2(
+                        rank_zero_based + 2
+                    )
+                )
 
-        profile_pop_raw_sum += float(profile_pop_raw[batch_users].sum().item())
-        profile_pop_norm_sum += float(profile_pop_norm[batch_users].sum().item())
+        # --------------------------------------------------------
+        # Popularity diagnosis
+        # --------------------------------------------------------
 
-        head_slots += int(head_mask[topk].sum().item())
-        tail_slots += int(tail_mask[topk].sum().item())
-        total_slots += int(topk.numel())
+        batch_rec_pop_raw = (
+            pop_raw[topk].mean(dim=1)
+        )
 
-    rec_matrix = torch.cat(all_recommended_items, dim=0)
-    unique_recommended = torch.unique(rec_matrix)
+        batch_rec_pop_norm = (
+            pop_norm[topk].mean(dim=1)
+        )
 
-    tail_item_count = int(dataset.tail_item_mask.sum().item())
-    rec_tail_mask = dataset.tail_item_mask[rec_matrix]
-    unique_tail_recommended = torch.unique(rec_matrix[rec_tail_mask])
+        rec_pop_raw_sum += float(
+            batch_rec_pop_raw.sum().item()
+        )
+
+        rec_pop_norm_sum += float(
+            batch_rec_pop_norm.sum().item()
+        )
+
+        profile_pop_raw_sum += float(
+            profile_pop_raw[
+                batch_users
+            ].sum().item()
+        )
+
+        profile_pop_norm_sum += float(
+            profile_pop_norm[
+                batch_users
+            ].sum().item()
+        )
+
+        head_slots += int(
+            head_mask[topk].sum().item()
+        )
+
+        tail_slots += int(
+            tail_mask[topk].sum().item()
+        )
+
+        total_slots += int(
+            topk.numel()
+        )
+
+    rec_matrix = torch.cat(
+        all_recommended_items,
+        dim=0,
+    )
+
+    unique_recommended = torch.unique(
+        rec_matrix
+    )
+
+    tail_item_count = int(
+        dataset.tail_item_mask.sum().item()
+    )
+
+    rec_tail_mask = (
+        dataset.tail_item_mask[
+            rec_matrix
+        ]
+    )
+
+    unique_tail_recommended = torch.unique(
+        rec_matrix[
+            rec_tail_mask
+        ]
+    )
 
     n_users = dataset.num_users
-    avg_rec_pop_raw = rec_pop_raw_sum / n_users
-    avg_rec_pop_norm = rec_pop_norm_sum / n_users
-    avg_profile_pop_raw = profile_pop_raw_sum / n_users
-    avg_profile_pop_norm = profile_pop_norm_sum / n_users
+
+    avg_rec_pop_raw = (
+        rec_pop_raw_sum / n_users
+    )
+
+    avg_rec_pop_norm = (
+        rec_pop_norm_sum / n_users
+    )
+
+    avg_profile_pop_raw = (
+        profile_pop_raw_sum / n_users
+    )
+
+    avg_profile_pop_norm = (
+        profile_pop_norm_sum / n_users
+    )
 
     return {
-        "Recall@K": recall_sum / n_users,
-        "NDCG@K": ndcg_sum / n_users,
-        "ARP_raw@K": avg_rec_pop_raw,
-        "ARP_norm@K": avg_rec_pop_norm,
-        "ProfilePopularity_raw": avg_profile_pop_raw,
-        "ProfilePopularity_norm": avg_profile_pop_norm,
-        "PopularityLift_raw@K": avg_rec_pop_raw - avg_profile_pop_raw,
-        "PopularityLift_norm@K": avg_rec_pop_norm - avg_profile_pop_norm,
-        "HeadRatio@K": head_slots / total_slots if total_slots else 0.0,
-        "TailRatio@K": tail_slots / total_slots if total_slots else 0.0,
-        "TailCoverage@K": (
-            len(unique_tail_recommended) / tail_item_count
-            if tail_item_count else 0.0
-        ),
-        "CatalogCoverage@K": (
-            len(unique_recommended) / dataset.num_items
-            if dataset.num_items else 0.0
-        ),
+        "Recall@K":
+            recall_sum / n_users,
+
+        "NDCG@K":
+            ndcg_sum / n_users,
+
+        "ARP_raw@K":
+            avg_rec_pop_raw,
+
+        "ARP_norm@K":
+            avg_rec_pop_norm,
+
+        "ProfilePopularity_raw":
+            avg_profile_pop_raw,
+
+        "ProfilePopularity_norm":
+            avg_profile_pop_norm,
+
+        "PopularityLift_raw@K":
+            avg_rec_pop_raw
+            - avg_profile_pop_raw,
+
+        "PopularityLift_norm@K":
+            avg_rec_pop_norm
+            - avg_profile_pop_norm,
+
+        "HeadRatio@K":
+            (
+                head_slots / total_slots
+                if total_slots
+                else 0.0
+            ),
+
+        "TailRatio@K":
+            (
+                tail_slots / total_slots
+                if total_slots
+                else 0.0
+            ),
+
+        "TailCoverage@K":
+            (
+                len(unique_tail_recommended)
+                / tail_item_count
+                if tail_item_count
+                else 0.0
+            ),
+
+        "CatalogCoverage@K":
+            (
+                len(unique_recommended)
+                / dataset.num_items
+                if dataset.num_items
+                else 0.0
+            ),
     }
-
-
 def save_history(rows: List[Dict[str, float]], path: Path) -> None:
     if not rows:
         return
@@ -397,8 +686,25 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         dropout=args.dropout,
     ).to(device)
 
+    projector =None
+    trainable_parameters = list(
+        model.parameters()
+    )
+
+    if source_user_repr_aligned is not None:
+
+        projector = nn.Linear(
+            args.embedding_dim,
+            args.embedding_dim,
+            bias=False,
+        ).to(device)
+
+        trainable_parameters += list(
+            projector.parameters()
+        )
+
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        trainable_parameters,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -435,14 +741,19 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+
+        if projector is not None:
+            projector.train()
+
         epoch_bpr = 0.0
         start_time = time.time()
 
         for _ in range(args.updates_per_epoch):
-            users, positives, negatives = dataset.sample_bpr_batch(
+            users, positives, negatives = (
+                target_dataset.sample_bpr_batch(
                 batch_size=args.batch_size,
                 rng=rng,
-            )
+            ))
             users = users.to(device)
             positives = positives.to(device)
             negatives = negatives.to(device)
@@ -464,7 +775,7 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
+                    trainable_parameters,
                     max_norm=args.grad_clip,
                 )
 
@@ -483,13 +794,20 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         if should_eval:
             val_metrics = evaluate(
                 model=model,
-                dataset=dataset,
+                dataset=target_dataset,
                 edge_index=edge_index,
                 edge_type=edge_type,
                 device=device,
                 split="val",
+                projector=projector,
+                source_user_repr_aligned=(
+                    source_user_repr_aligned
+                ),
+                transfer_scale=args.alpha,
                 k=args.topk,
-                user_batch_size=args.eval_user_batch_size,
+                user_batch_size=(
+                    args.eval_user_batch_size
+                ),
             )
             for key, value in val_metrics.items():
                 row[f"val_{key}"] = value
@@ -514,11 +832,49 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
                 patience_counter = 0
                 torch.save(
                     {
-                        "model_state_dict": model.state_dict(),
-                        "args": vars(args),
-                        "dataset_stats": asdict(dataset.stats),
-                        "best_val_ndcg": best_val_ndcg,
-                        "best_epoch": best_epoch,
+                        "target_model_state_dict":
+                            model.state_dict(),
+
+                        "projector_state_dict":
+                            (
+                                projector.state_dict()
+                                if projector is not None
+                                else None
+                            ),
+
+                        "args":
+                            vars(args),
+
+                        "dataset_stats":
+                            asdict(
+                                target_dataset.stats
+                            ),
+
+                        "best_val_ndcg":
+                            best_val_ndcg,
+
+                        "best_epoch":
+                            best_epoch,
+
+                        "source_checkpoint":
+                            (
+                                args.source_checkpoint
+                                if source_user_repr_aligned
+                                   is not None
+                                else None
+                            ),
+
+                        "source_domain":
+                            SOURCE_DOMAIN,
+
+                        "target_domain":
+                            TARGET_DOMAIN,
+
+                        "transfer_mode":
+                            args.transfer_mode,
+
+                        "alpha":
+                            args.alpha,
                     },
                     checkpoint_path,
                 )
@@ -557,21 +913,40 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
     test_metrics = evaluate(
         model=model,
-        dataset=dataset,
+        dataset=target_dataset,
         edge_index=edge_index,
         edge_type=edge_type,
         device=device,
         split="test",
+        projector=projector,
+        source_user_repr_aligned=(
+            source_user_repr_aligned
+        ),
+        transfer_scale=args.alpha,
         k=args.topk,
-        user_batch_size=args.eval_user_batch_size,
+        user_batch_size=(
+            args.eval_user_batch_size
+        ),
     )
 
     result = {
         **vars(args),
-        **asdict(dataset.stats),
-        "best_epoch": int(checkpoint["best_epoch"]),
-        "best_val_ndcg": float(checkpoint["best_val_ndcg"]),
+        **asdict(
+            target_dataset.stats
+        ),
+        "best_epoch":
+            int(
+                checkpoint["best_epoch"]
+            ),
+        "best_val_ndcg":
+            float(
+                checkpoint[
+                    "best_val_ndcg"
+                ]
+            ),
     }
+
+
     for key, value in test_metrics.items():
         result[f"test_{key}"] = float(value)
 
