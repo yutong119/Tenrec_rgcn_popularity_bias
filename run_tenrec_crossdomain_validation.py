@@ -82,6 +82,100 @@ def align_source_users_to_target(
 
     return aligned
 
+def load_frozen_source_user_repr(
+        args:argparse.Namespace,
+        device: torch.device,
+        source_dataset: TenRecFullGraphDataset,
+        target_dataset: TenRecFullGraphDataset,
+) -> torch.Tensor | None:
+
+    if args.transfer_mode == "target_only":
+        return None
+
+    checkpoint = torch.load(
+        args.source_checkpoint,
+        map_location=device,
+    )
+
+    source_args = checkpoint["args"]
+
+    if source_args.get("domain") != SOURCE_DOMAIN:
+        raise ValueError(
+            "Source checkpoint must be trained on QK-video."
+        )
+
+    source_embedding_dim = int(
+        source_args["embedding_dim"]
+    )
+
+    if source_embedding_dim != args.embedding_dim:
+        raise ValueError(
+            "Embedding dimension mismatch: "
+            f"source={source_embedding_dim}, "
+            f"target={args.embedding_dim}"
+        )
+
+    source_model = TenRecFullGraphRGCN(
+        num_users=source_dataset.num_users,
+        num_items=source_dataset.num_items,
+        embedding_dim=source_embedding_dim,
+        num_relations=8,
+        num_bases=source_args.get("num_bases"),
+        dropout=source_args.get("dropout", 0.0),
+    ).to(device)
+
+    source_model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    source_model.eval()
+
+    for parameter in source_model.parameters():
+        parameter.requires_grad = False
+
+    source_edge_index = (
+        source_dataset.edge_index.to(device)
+    )
+
+    source_edge_type = (
+        source_dataset.edge_type.to(device)
+    )
+
+    with torch.no_grad():
+        source_user_repr, _ = source_model.encode(
+            source_edge_index,
+            source_edge_type,
+        )
+
+    source_user_repr = (
+        source_user_repr.detach()
+    )
+
+    aligned = align_source_users_to_target(
+        source_dataset=source_dataset,
+        target_dataset=target_dataset,
+        source_user_repr=source_user_repr,
+    )
+
+    if args.transfer_mode == "shuffled":
+        generator = torch.Generator(
+            device="cpu"
+        )
+
+        generator.manual_seed(
+            args.seed + 9999
+        )
+
+        permutation = torch.randperm(
+            target_dataset.num_users,
+            generator=generator,
+        ).to(device)
+
+        aligned = aligned[permutation]
+
+    return aligned.detach()
+
+
 def bpr_loss(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
@@ -271,6 +365,18 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
     print("\n===== TARGET: QK-article =====")
     target_dataset.print_summary()
 
+    edge_index = target_dataset.edge_index.to(device)
+    edge_type = target_dataset.edge_type.to(device)
+
+    source_user_repr_aligned = (
+        load_frozen_source_user_repr(
+            args=args,
+            device=device,
+            source_dataset=source_dataset,
+            target_dataset=target_dataset,
+        )
+    )
+
     dataset = target_dataset
 
     dataset.print_summary()
@@ -280,8 +386,7 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
     )
     target_dataset.split_manifest().to_csv(split_path, index=False)
 
-    edge_index = dataset.edge_index.to(device)
-    edge_type = dataset.edge_type.to(device)
+    set_seed(args.seed)
 
     model = TenRecFullGraphRGCN(
         num_users=dataset.num_users,
@@ -512,12 +617,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--prepared_root", type=str, default="tenrec_rgcn_prepared")
     parser.add_argument("--subset", type=int, choices=[3000, 5000], default=3000)
-    parser.add_argument(
-        "--domain",
-        type=str,
-        choices=["QK-video", "QK-article"],
-        default="QK-video",
-    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min_clicks", type=int, default=5)
     parser.add_argument("--embedding_dim", type=int, default=64)
@@ -547,6 +646,37 @@ def parse_args() -> argparse.Namespace:
         "--output_dir",
         type=str,
         default="outputs/tenrec_baseline_diagnosis_v1",
+    )
+    parser.add_argument(
+        "--source_checkpoint",
+        type=str,
+        default=(
+            "outputs/control_video_3k_rgcn/"
+            "best_2layer_rgcn_QK-video_3000_seed42.pt"
+        ),
+    )
+    parser.add_argument(
+        "--source_checkpoint",
+        type=str,
+        default=(
+            "outputs/control_video_3k_rgcn/"
+            "best_2layer_rgcn_QK-video_3000_seed42.pt"
+        ),
+    )
+    parser.add_argument(
+        "--transfer_mode",
+        type=str,
+        choices=[
+            "target_only",
+            "correct",
+            "shuffled",
+        ],
+        default="correct",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
     )
     return parser.parse_args()
 
