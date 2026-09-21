@@ -666,6 +666,47 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         )
     )
 
+    # ============================================================
+    # Sanity checks for transferred Source representation
+    # ============================================================
+
+    if source_user_repr_aligned is not None:
+
+        expected_shape = (
+            target_dataset.num_users,
+            args.embedding_dim,
+        )
+
+        actual_shape = tuple(
+            source_user_repr_aligned.shape
+        )
+
+        print(
+            "\nTransferred Source "
+            f"user representation shape: "
+            f"{actual_shape}"
+        )
+
+        if actual_shape != expected_shape:
+            raise RuntimeError(
+                "Transferred Source user "
+                "representation has wrong shape.\n"
+                f"Expected: {expected_shape}\n"
+                f"Actual  : {actual_shape}"
+            )
+
+        if source_user_repr_aligned.requires_grad:
+            raise RuntimeError(
+                "Frozen Source representation "
+                "must not require gradients."
+            )
+
+    else:
+        print(
+            "\nNo Source user representation "
+            "will be used (target_only)."
+        )
+
     dataset = target_dataset
 
     dataset.print_summary()
@@ -703,6 +744,39 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
             projector.parameters()
         )
 
+    # ============================================================
+    # Transfer-mode consistency checks
+    # ============================================================
+
+    if args.transfer_mode == "target_only":
+
+        if source_user_repr_aligned is not None:
+            raise RuntimeError(
+                "target_only mode must not "
+                "contain Source representations."
+            )
+
+        if projector is not None:
+            raise RuntimeError(
+                "target_only mode must not "
+                "create a projector."
+            )
+
+    else:
+
+        if source_user_repr_aligned is None:
+            raise RuntimeError(
+                f"{args.transfer_mode} mode requires "
+                "Source user representations."
+            )
+
+        if projector is None:
+            raise RuntimeError(
+                f"{args.transfer_mode} mode requires "
+                "a Source-to-Target projector."
+            )
+
+
     optimizer = torch.optim.Adam(
         trainable_parameters,
         lr=args.lr,
@@ -715,29 +789,96 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
     best_epoch = -1
     patience_counter = 0
 
-    checkpoint_path = output_dir / (
-        f"best_baseline_{args.domain}_{args.subset}_seed{args.seed}.pt"
+    # ============================================================
+    # Unique experiment name
+    # ============================================================
+
+    run_name = (
+        f"{args.transfer_mode}_"
+        f"{SOURCE_DOMAIN}_to_{TARGET_DOMAIN}_"
+        f"{args.subset}_"
+        f"seed{args.seed}"
     )
-    history_path = output_dir / (
-        f"history_baseline_{args.domain}_{args.subset}_seed{args.seed}.csv"
+
+    checkpoint_path = (
+            output_dir
+            / f"best_{run_name}.pt"
     )
-    result_path = output_dir / (
-        f"result_baseline_{args.domain}_{args.subset}_seed{args.seed}.json"
+
+    history_path = (
+            output_dir
+            / f"history_{run_name}.csv"
     )
+
+    result_path = (
+            output_dir
+            / f"result_{run_name}.json"
+    )
+
 
     history_rows: List[Dict[str, float]] = []
 
     print("\n" + "=" * 72)
-    print("PURE BASELINE TRAINING")
+    print("ONE-WAY CROSS-DOMAIN RGCN VALIDATION")
     print("=" * 72)
-    print(f"Device             : {device}")
-    print(f"Embedding dim      : {args.embedding_dim}")
-    print(f"Epochs             : {args.epochs}")
-    print(f"Updates / epoch    : {args.updates_per_epoch}")
-    print(f"BPR batch size     : {args.batch_size}")
-    print("Training objective : BPR ONLY")
-    print("Popularity in loss : NO")
-    print("Popularity rerank  : NO")
+    print(
+        f"Source domain       : "
+        f"{SOURCE_DOMAIN}"
+    )
+    print(
+        f"Target domain       : "
+        f"{TARGET_DOMAIN}"
+    )
+    print(
+        f"Transfer mode       : "
+        f"{args.transfer_mode}"
+    )
+    print(
+        f"Source frozen       : YES"
+    )
+    print(
+        f"Source representation: "
+        f"{'USED' if source_user_repr_aligned is not None else 'NOT USED'}"
+    )
+    print(
+        f"Projector           : "
+        f"{'TRAINABLE' if projector is not None else 'NONE'}"
+    )
+    print(
+        f"Transfer alpha      : "
+        f"{args.alpha}"
+    )
+    print(
+        f"Device              : "
+        f"{device}"
+    )
+    print(
+        f"Embedding dim       : "
+        f"{args.embedding_dim}"
+    )
+    print(
+        f"Epochs              : "
+        f"{args.epochs}"
+    )
+    print(
+        f"Updates / epoch     : "
+        f"{args.updates_per_epoch}"
+    )
+    print(
+        f"BPR batch size      : "
+        f"{args.batch_size}"
+    )
+    print(
+        "Training objective  : "
+        "TARGET BPR ONLY"
+    )
+    print(
+        "Popularity in loss  : NO"
+    )
+    print(
+        "Popularity rerank   : NO"
+    )
+    print("=" * 72)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -931,13 +1072,65 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
     result = {
         **vars(args),
+
         **asdict(
             target_dataset.stats
         ),
+
+        # --------------------------------------------------------
+        # Cross-domain experiment identity
+        # --------------------------------------------------------
+
+        "source_domain":
+            SOURCE_DOMAIN,
+
+        "target_domain":
+            TARGET_DOMAIN,
+
+        "transfer_direction":
+            (
+                f"{SOURCE_DOMAIN}"
+                f" -> "
+                f"{TARGET_DOMAIN}"
+            ),
+
+        "transfer_mode":
+            args.transfer_mode,
+
+        "source_frozen":
+            True,
+
+        "source_information_used":
+            (
+                    source_user_repr_aligned
+                    is not None
+            ),
+
+        "source_user_alignment":
+            (
+                "none"
+                if args.transfer_mode
+                   == "target_only"
+                else args.transfer_mode
+            ),
+
+        "projector_used":
+            projector is not None,
+
+        "transfer_alpha":
+            float(args.alpha),
+
+        # --------------------------------------------------------
+        # Best validation checkpoint
+        # --------------------------------------------------------
+
         "best_epoch":
             int(
-                checkpoint["best_epoch"]
+                checkpoint[
+                    "best_epoch"
+                ]
             ),
+
         "best_val_ndcg":
             float(
                 checkpoint[
@@ -946,7 +1139,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
             ),
     }
 
-
     for key, value in test_metrics.items():
         result[f"test_{key}"] = float(value)
 
@@ -954,8 +1146,23 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
     print("\n" + "=" * 72)
-    print("BEST BASELINE MODEL - TEST + POPULARITY DIAGNOSIS")
+
+    print(
+        "BEST ONE-WAY CDR MODEL "
+        "- TEST + POPULARITY DIAGNOSIS"
+    )
+
     print("=" * 72)
+
+    print(
+        f"Transfer mode                 : "
+        f"{args.transfer_mode}"
+    )
+
+    print(
+        f"Transfer direction            : "
+        f"{SOURCE_DOMAIN} -> {TARGET_DOMAIN}"
+    )
     print(f"Best epoch                    : {result['best_epoch']}")
     print("\nRecommendation performance:")
     print(f"Recall@{args.topk}                    : {test_metrics['Recall@K']:.6f}")
