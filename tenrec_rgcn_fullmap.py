@@ -11,8 +11,6 @@ class TenRecFullGraphRGCN(nn.Module):
     """
     Pure FullGraph mul
 
-    +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ti-relational RGCN baseline.
-
     This model has NO popularity input, NO popularity penalty,
     NO popularity-aware reranking, and NO cross-domain transfer.
     Training is performed with BPR only in the experiment runner.
@@ -92,14 +90,38 @@ class TenRecFullGraphRGCN(nn.Module):
         self,
         edge_index: torch.Tensor,
         edge_type: torch.Tensor,
+        external_user_context: torch.Tensor | None = None,
+        transfer_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute the whole graph ONCE.
+        Compute full-graph RGCN representations.
 
-        Returns:
-            user_repr: [num_users, d]
-            item_repr: [num_items, d]
+        external_user_context:
+            Optional external user representation, e.g. transferred
+            from the source domain.
+
+        transfer_scale:
+            Strength of the transferred source representation.
+
+        When external_user_context is None, this is EXACTLY the
+        original single-domain baseline.
         """
+        user_x0 = self.user_embedding.weight
+
+        if external_user_context is not None:
+
+            if external_user_context.shape != user_x0.shape:
+                raise ValueError(
+                    "external_user_context must have shape"
+                    f"{tuple(user_x0.shape)},"
+                    f"but got {tuple(external_user_context.shape)}"
+                )
+
+            user_x0 = (
+                user_x0
+                + transfer_scale * external_user_context
+            )
+
         x0 = torch.cat(
             [
                 self.user_embedding.weight,
