@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from tenrec_rgcn_dataset import TenRecFullGraphDataset
 from tenrec_rgcn_fullmap import TenRecFullGraphRGCN
 
+SOURCE_DOMAIN = "QK-video"
+TARGET_DOMAIN = "QK-article"
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -36,6 +38,49 @@ def choose_device(requested: str) -> torch.device:
         return torch.device("cpu")
     return torch.device(requested)
 
+def align_source_users_to_target(
+        source_dataset: TenRecFullGraphDataset,
+        target_dataset: TenRecFullGraphDataset,
+        source_user_repr: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Align source user representation to the target user index order
+    using raw TenRec user IDs.
+    """
+
+    source_indices = []
+    missing_users = []
+
+    for raw_uid in target_dataset.idx_to_raw_user:
+        raw_uid = int(raw_uid)
+
+        source_idx = source_dataset.raw_user_to_idx.get(raw_uid)
+
+        if source_idx is None:
+            missing_users.append(raw_uid)
+        else:
+            source_indices.append(source_idx)
+
+    if missing_users:
+        raise ValueError(
+            f"{len(missing_users)} target users are missing "
+            "from the source domain."
+        )
+
+    source_indices = torch.tensor(
+        source_indices,
+        dtype=torch.long,
+        device=source_user_repr.device,
+    )
+
+    aligned = source_user_repr[source_indices]
+
+    if aligned.shape[0] != target_dataset.num_users:
+        raise RuntimeError(
+            "Aligned source user count does not match target user count."
+        )
+
+    return aligned
 
 def bpr_loss(
     positive_scores: torch.Tensor,
@@ -204,19 +249,36 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = TenRecFullGraphDataset(
+    source_dataset = TenRecFullGraphDataset(
         prepared_root=args.prepared_root,
         subset_size=args.subset,
-        domain=args.domain,
+        domain=SOURCE_DOMAIN,
         seed=args.seed,
         min_clicks_both_domains=args.min_clicks,
     )
+
+    target_dataset = TenRecFullGraphDataset(
+        prepared_root = args.prepared_root,
+        subset_size = args.subset,
+        domain = TARGET_DOMAIN,
+        seed = args.seed,
+        min_clicks_both_domains = args.min_clicks,
+    )
+
+    print("\n===== SOURCE: QK-video =====")
+    source_dataset.print_summary()
+
+    print("\n===== TARGET: QK-article =====")
+    target_dataset.print_summary()
+
+    dataset = target_dataset
+
     dataset.print_summary()
 
     split_path = output_dir / (
-        f"split_{args.domain}_{args.subset}_seed{args.seed}.csv"
+        f"split_{TARGET_DOMAIN}_{args.subset}_seed{args.seed}.csv"
     )
-    dataset.split_manifest().to_csv(split_path, index=False)
+    target_dataset.split_manifest().to_csv(split_path, index=False)
 
     edge_index = dataset.edge_index.to(device)
     edge_type = dataset.edge_type.to(device)
