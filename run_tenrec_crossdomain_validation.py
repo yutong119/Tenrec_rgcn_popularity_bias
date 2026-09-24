@@ -93,32 +93,18 @@ def load_frozen_source_user_repr(
     if args.transfer_mode == "target_only":
         return None
 
+    source_checkpoint_path = Path(args.source_checkpoint)
+
+    if not source_checkpoint_path.exists():
+        raise FileNotFoundError(
+            "Missing source checkpoint:\n"
+            f"{source_checkpoint_path}"
+        )
+
     checkpoint = torch.load(
-        checkpoint_path,
+        source_checkpoint_path,
         map_location=device,
     )
-
-    model.load_state_dict(
-        checkpoint[
-            "target_model_state_dict"
-        ]
-    )
-
-    if projector is not None:
-
-        projector_state = checkpoint[
-            "projector_state_dict"
-        ]
-
-        if projector_state is None:
-            raise RuntimeError(
-                "Current run requires a projector, "
-                "but checkpoint has no projector state."
-            )
-
-        projector.load_state_dict(
-            projector_state
-        )
 
     source_args = checkpoint["args"]
 
@@ -199,6 +185,54 @@ def load_frozen_source_user_repr(
     return aligned.detach()
 
 
+@torch.no_grad()
+def compute_representation_path_change(
+    model: TenRecFullGraphRGCN,
+    edge_index: torch.Tensor,
+    edge_type: torch.Tensor,
+    projector: nn.Module,
+    source_user_repr_aligned: torch.Tensor,
+) -> float:
+    """
+    Verify that projected Source context changes Target user
+    representations for the same current Target model.
+    """
+
+    model_was_training = model.training
+    projector_was_training = projector.training
+
+    model.eval()
+    projector.eval()
+
+    user_without_source, _ = model.encode(
+        edge_index,
+        edge_type,
+    )
+
+    external_user_context = projector(
+        source_user_repr_aligned
+    )
+
+    user_with_source, _ = model.encode(
+        edge_index,
+        edge_type,
+        external_user_context=external_user_context,
+    )
+
+    mean_change = (
+        user_with_source
+        - user_without_source
+    ).norm(dim=1).mean()
+
+    if model_was_training:
+        model.train()
+
+    if projector_was_training:
+        projector.train()
+
+    return float(mean_change.item())
+
+
 def bpr_loss(
     positive_scores: torch.Tensor,
     negative_scores: torch.Tensor,
@@ -219,7 +253,6 @@ def evaluate(
     split: Literal["val", "test"],
     projector: nn.Module | None = None,
     source_user_repr_aligned: torch.Tensor | None = None,
-    transfer_scale: float = 1.0,
     k: int = 10,
     user_batch_size: int = 128,
 ) -> Dict[str, float]:
@@ -279,34 +312,6 @@ def evaluate(
     # ------------------------------------------------------------
 
     # ------------------------------------------------------------
-    # Build transferred Source context.
-    #
-    # target_only:
-    #     external_user_context = None
-    #
-    # correct / shuffled:
-    #     frozen Source repr
-    #          ↓
-    #     trainable projector
-    #          ↓
-    #     Target embedding space
-    # ------------------------------------------------------------
-
-    external_user_context = None
-
-    if source_user_repr_aligned is not None:
-
-        if projector is None:
-            raise RuntimeError(
-                "Source user representations exist "
-                "but projector is None."
-            )
-
-        external_user_context = projector(
-            source_user_repr_aligned
-        )
-
-    # ------------------------------------------------------------
     # One full Target-domain RGCN convolution per optimizer update.
     #
     # Source information enters BEFORE Target RGCN propagation.
@@ -316,7 +321,6 @@ def evaluate(
         edge_index,
         edge_type,
         external_user_context=external_user_context,
-        transfer_scale=args.alpha,
     )
 
     if split == "val":
@@ -626,7 +630,6 @@ def save_history(rows: List[Dict[str, float]], path: Path) -> None:
 
 
 def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
-    set_seed(args.seed)
     device = choose_device(args.device)
 
     output_dir = Path(args.output_dir)
@@ -700,6 +703,8 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
                 "Frozen Source representation "
                 "must not require gradients."
             )
+
+        assert source_user_repr_aligned.requires_grad is False
 
     else:
         print(
@@ -776,6 +781,32 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
                 "a Source-to-Target projector."
             )
 
+    representation_mean_change: float | None = None
+
+    if (
+        args.transfer_mode == "correct"
+        and projector is not None
+        and source_user_repr_aligned is not None
+    ):
+        representation_mean_change = compute_representation_path_change(
+            model=model,
+            edge_index=edge_index,
+            edge_type=edge_type,
+            projector=projector,
+            source_user_repr_aligned=source_user_repr_aligned,
+        )
+
+        print(
+            "\nRepresentation path sanity "
+            f"mean_change={representation_mean_change:.8f}"
+        )
+
+        if representation_mean_change <= 0.0:
+            raise RuntimeError(
+                "Projected Source context did not change "
+                "Target user representations."
+            )
+
 
     optimizer = torch.optim.Adam(
         trainable_parameters,
@@ -817,6 +848,7 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
 
     history_rows: List[Dict[str, float]] = []
+    projector_grad_checked = False
 
     print("\n" + "=" * 72)
     print("ONE-WAY CROSS-DOMAIN RGCN VALIDATION")
@@ -843,10 +875,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
     print(
         f"Projector           : "
         f"{'TRAINABLE' if projector is not None else 'NONE'}"
-    )
-    print(
-        f"Transfer alpha      : "
-        f"{args.alpha}"
     )
     print(
         f"Device              : "
@@ -902,7 +930,25 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
             optimizer.zero_grad(set_to_none=True)
 
             # One full-graph convolution per optimizer update.
-            user_repr, item_repr = model.encode(edge_index, edge_type)
+            external_user_context = None
+
+            if source_user_repr_aligned is not None:
+
+                if projector is None:
+                    raise RuntimeError(
+                        "Source user representations exist "
+                        "but projector is None."
+                    )
+
+                external_user_context = projector(
+                    source_user_repr_aligned
+                )
+
+            user_repr, item_repr = model.encode(
+                edge_index,
+                edge_type,
+                external_user_context=external_user_context,
+            )
 
             positive_scores = model.score_pairs(
                 users, positives, user_repr, item_repr
@@ -913,6 +959,32 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
             loss = bpr_loss(positive_scores, negative_scores)
             loss.backward()
+
+            if projector is not None and not projector_grad_checked:
+                projector_grad = projector.weight.grad
+
+                if projector_grad is None:
+                    raise RuntimeError(
+                        "Projector gradient is None after "
+                        "the first backward pass."
+                    )
+
+                projector_grad_norm = float(
+                    projector_grad.norm().item()
+                )
+
+                print(
+                    "Projector gradient sanity "
+                    f"norm={projector_grad_norm:.8f}"
+                )
+
+                if projector_grad_norm <= 0.0:
+                    raise RuntimeError(
+                        "Projector gradient norm is zero after "
+                        "the first backward pass."
+                    )
+
+                projector_grad_checked = True
 
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -944,7 +1016,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
                 source_user_repr_aligned=(
                     source_user_repr_aligned
                 ),
-                transfer_scale=args.alpha,
                 k=args.topk,
                 user_batch_size=(
                     args.eval_user_batch_size
@@ -1013,9 +1084,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
                         "transfer_mode":
                             args.transfer_mode,
-
-                        "alpha":
-                            args.alpha,
                     },
                     checkpoint_path,
                 )
@@ -1050,7 +1118,19 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         )
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(
+        checkpoint["target_model_state_dict"]
+    )
+
+    if projector is not None:
+        projector_state = checkpoint["projector_state_dict"]
+
+        if projector_state is None:
+            raise RuntimeError(
+                "Best checkpoint is missing projector_state_dict."
+            )
+
+        projector.load_state_dict(projector_state)
 
     test_metrics = evaluate(
         model=model,
@@ -1063,7 +1143,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
         source_user_repr_aligned=(
             source_user_repr_aligned
         ),
-        transfer_scale=args.alpha,
         k=args.topk,
         user_batch_size=(
             args.eval_user_batch_size
@@ -1116,9 +1195,6 @@ def train_one_run(args: argparse.Namespace) -> Dict[str, float]:
 
         "projector_used":
             projector is not None,
-
-        "transfer_alpha":
-            float(args.alpha),
 
         # --------------------------------------------------------
         # Best validation checkpoint
@@ -1238,14 +1314,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--source_checkpoint",
-        type=str,
-        default=(
-            "outputs/control_video_3k_rgcn/"
-            "best_2layer_rgcn_QK-video_3000_seed42.pt"
-        ),
-    )
-    parser.add_argument(
         "--transfer_mode",
         type=str,
         choices=[
@@ -1254,11 +1322,6 @@ def parse_args() -> argparse.Namespace:
             "shuffled",
         ],
         default="correct",
-    )
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=1.0,
     )
     return parser.parse_args()
 

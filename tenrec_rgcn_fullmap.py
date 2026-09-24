@@ -91,7 +91,6 @@ class TenRecFullGraphRGCN(nn.Module):
         edge_index: torch.Tensor,
         edge_type: torch.Tensor,
         external_user_context: torch.Tensor | None = None,
-        transfer_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute full-graph RGCN representations.
@@ -99,9 +98,6 @@ class TenRecFullGraphRGCN(nn.Module):
         external_user_context:
             Optional external user representation, e.g. transferred
             from the source domain.
-
-        transfer_scale:
-            Strength of the transferred source representation.
 
         When external_user_context is None, this is EXACTLY the
         original single-domain baseline.
@@ -119,12 +115,12 @@ class TenRecFullGraphRGCN(nn.Module):
 
             user_x0 = (
                 user_x0
-                + transfer_scale * external_user_context
+                + external_user_context
             )
 
         x0 = torch.cat(
             [
-                self.user_embedding.weight,
+                user_x0,
                 self.item_embedding.weight,
             ],
             dim=0,
